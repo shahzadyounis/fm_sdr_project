@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fixed FM receiver for ADRV9364 – larger blocks, proper audio length.
+Optimized FM receiver for ADRV9364 – real-time on ARM.
 """
 
 import adi
@@ -13,25 +13,33 @@ import sys
 import signal as sig
 import scipy.signal as sp_signal
 
-# ---------- Configuration ----------
-BOARD_IP = "192.168.18.50"          # Your ADRV board's IP
-RX_FREQ = 105.2e6                   # Will be overwritten by saved channel
+# ---------- Configuration (OPTIMIZED) ----------
+BOARD_IP = "192.168.18.50"
+RX_FREQ = 105.2e6                   # or loaded from file
 SAMPLE_RATE_RX = 2.4e6              # 2.4 MHz
-BANDWIDTH = 200e3                   # 200 kHz
-GAIN = 40                           # dB (increase if needed, e.g. 50)
+BANDWIDTH = 200e3
+GAIN = 30                           # lower gain to avoid distortion
 
-AUDIO_RATE = 48000
-FM_DEVIATION = 75000                # Try 50000 if station sounds dull/high-pitched
-DEEMPHASIS_TC = 50e-6               # 50 µs (US/Europe)
+AUDIO_RATE = 48000                  # 48 kHz for clear audio
+FM_DEVIATION = 50000                # try 75000 if too quiet
+DEEMPHASIS_TC = 50e-6
 
-UDP_IP = "192.168.18.42"            # Your host PC's IP
+UDP_IP = "192.168.18.42"
 UDP_PORT = 12345
 
-# Buffer sizes: IQ block ~ 262144 samples = 109 ms
-IQ_BLOCK_SIZE = 262144
-AUDIO_BLOCK_SIZE = int(IQ_BLOCK_SIZE * AUDIO_RATE / SAMPLE_RATE_RX)   # ~5240 samples
-IQ_QUEUE_SIZE = 5
-AUDIO_QUEUE_SIZE = 10
+# Lightweight block sizes (20 ms of IQ data)
+IQ_BLOCK_SIZE = 48000               # 48000 samples = 20 ms at 2.4 MHz
+AUDIO_BLOCK_SIZE = int(IQ_BLOCK_SIZE * AUDIO_RATE / SAMPLE_RATE_RX)   # = 960 samples
+IQ_QUEUE_SIZE = 3
+AUDIO_QUEUE_SIZE = 5
+
+# ---------- Fast resampling (linear interpolation) ----------
+def fast_resample(audio, old_fs, new_fs):
+    """Linear interpolation resampling – very fast, no FFT."""
+    old_len = len(audio)
+    new_len = int(old_len * new_fs / old_fs)
+    indices = np.linspace(0, old_len - 1, new_len)
+    return np.interp(indices, np.arange(old_len), audio)
 
 # ---------- Signal processing (optimised) ----------
 def design_filter(cutoff, fs, numtaps=101):
@@ -60,9 +68,8 @@ def iq_to_audio(iq_samples, fs_rx, fs_audio, deviation, deemphasis_tau):
     # 3. Low‑pass filter (15 kHz)
     lpf = design_filter(15000, fs_rx)
     audio_filtered = sp_signal.lfilter(lpf, 1.0, audio_deemph)
-    # 4. Resample to audio rate
-    target_len = int(len(audio_filtered) * fs_audio / fs_rx)
-    audio_resampled = sp_signal.resample(audio_filtered, target_len)
+    # 4. Fast resampling (linear interpolation, much lighter than FFT)
+    audio_resampled = fast_resample(audio_filtered, fs_rx, fs_audio)
     # 5. Normalise and convert to int16
     max_val = np.max(np.abs(audio_resampled))
     if max_val > 0:
@@ -95,13 +102,14 @@ def rx_thread(stop_event, iq_queue, sdr):
     total_samples = 0
     while not stop_event.is_set():
         try:
-            iq = sdr.rx()   # returns IQ_BLOCK_SIZE samples
+            iq = sdr.rx()
             iq_queue.put(iq, timeout=0.2)
             total_samples += len(iq)
             if total_samples % (IQ_BLOCK_SIZE * 100) == 0:
                 print(f"Captured {total_samples} IQ samples")
         except queue.Full:
-            print("IQ queue full (non‑critical)")
+            # This is expected if processing is slightly slower – not fatal
+            pass
         except Exception as e:
             print(f"RX error: {e}")
             time.sleep(0.1)
@@ -136,7 +144,7 @@ def stream_thread(stop_event, audio_queue, streamer):
 
 # ---------- Main ----------
 def main():
-    # Load saved frequency from scanner
+    # Load saved frequency
     try:
         with open("selected_channel.txt", "r") as f:
             rx_freq = float(f.read().strip())
@@ -155,7 +163,7 @@ def main():
     sdr.gain_control_mode = 'slow_attack'
     sdr.rx_hardwaregain = GAIN
     sdr.rx_enabled_channels = [0]
-    sdr.rx_buffer_size = IQ_BLOCK_SIZE   # Very important
+    sdr.rx_buffer_size = IQ_BLOCK_SIZE
 
     print(f"Receiver configured:\n"
           f"  Frequency: {rx_freq/1e6:.3f} MHz\n"
