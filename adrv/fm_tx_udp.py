@@ -1,4 +1,4 @@
-```python
+
 import adi
 import numpy as np
 import socket
@@ -163,4 +163,4 @@ sock.close()
 del sdr
 
 print("Resources released.")
-```
+
